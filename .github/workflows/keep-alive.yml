@@ -2,7 +2,7 @@ name: Keep Render Service Awake
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # ping mỗi 5 phút
+    - cron: "*/5 * * * *" # ping mỗi 5 phút
   workflow_dispatch:
 
 jobs:
@@ -11,5 +11,5 @@ jobs:
     steps:
       - name: Ping Render Health Endpoint
         run: |
-          curl -fsS https://voice-app-be.onrender.com/health \
+          curl -fsS https://voice-app-be.onrender.com/ping \
           || echo "Render sleeping at $(date)"
