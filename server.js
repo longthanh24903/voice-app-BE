@@ -4,7 +4,6 @@ import cors from "cors";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { HttpProxyAgent } from "http-proxy-agent";
-import { loadProxies } from "./src/proxyLoader.js";
 import { ProxyRotator } from "./src/proxyRotator.js";
 
 dotenv.config();
@@ -12,7 +11,6 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const FORWARD_SECRET = process.env.FORWARD_SECRET || "";
-const PROXY_FILE = process.env.PROXY_FILE || "proxies.txt";
 
 // Middleware
 app.use(
@@ -26,17 +24,11 @@ app.use(
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-// Load proxies at startup
-const proxies = loadProxies(PROXY_FILE);
-const proxyRotator = new ProxyRotator(proxies);
+// Initialize proxy rotator with empty list (proxies will be added via API)
+const proxyRotator = new ProxyRotator([]);
 
 console.log(`[Server] Started with ${proxyRotator.getProxyCount()} proxies`);
-if (proxyRotator.getProxyCount() === 0) {
-  console.warn(`[Server] WARNING: No proxies loaded from ${PROXY_FILE}`);
-  console.warn(
-    `[Server] Please add proxies to ${PROXY_FILE} in format: ip:port:user:pass or http://user:pass@ip:port`
-  );
-}
+console.log(`[Server] Proxies must be added via POST /api/proxies endpoint`);
 console.log(
   `[Server] Forward secret: ${
     FORWARD_SECRET ? "Configured" : "Not configured (public access allowed)"
@@ -89,7 +81,7 @@ async function makeProxyRequest(url, method, headers, body) {
   // Check if proxies are available
   if (proxyRotator.getProxyCount() === 0) {
     throw new Error(
-      "No proxies configured. Please add proxies to proxies.txt file"
+      "No proxies configured. Please add proxies via POST /api/proxies endpoint"
     );
   }
 
@@ -185,8 +177,15 @@ async function makeProxyRequest(url, method, headers, body) {
         `[ProxyRequest] Success - Proxy: ${proxyString}, Status: ${response.status}, Attempt: ${attempt}`
       );
 
-      // Mark proxy as successfully used today
-      proxyRotator.markUsedToday(proxyIndex);
+      // Mark proxy as successfully used today (only if request was successful)
+      // Note: We accept all status codes (validateStatus: () => true), so check status here
+      if (response.status >= 200 && response.status < 300) {
+        proxyRotator.markUsedToday(proxyIndex);
+      } else {
+        // Non-2xx status codes are treated as failures for proxy rotation
+        proxyRotator.markFailed(proxyIndex);
+        throw new Error(`Request failed with status ${response.status}`);
+      }
 
       // Handle response body based on responseType
       let responseBody = response.data;
@@ -213,13 +212,19 @@ async function makeProxyRequest(url, method, headers, body) {
         status: response.status,
         headers: response.headers,
         body: responseBody,
+        proxyUsed: proxyRotator.formatProxy(currentProxy), // Include proxy info for logging
       };
     } catch (error) {
       lastError = error;
-      proxyRotator.markFailed(proxyIndex);
+      
+      // Only mark as failed if we have a valid proxy index
+      if (proxyIndex !== null && proxyIndex !== undefined) {
+        proxyRotator.markFailed(proxyIndex);
+      }
 
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
       console.error(
-        `[ProxyRequest] Failed - Proxy: ${proxyString}, Error: ${error.message}`
+        `[ProxyRequest] Failed - Proxy: ${proxyString}, Error: ${errorMessage}`
       );
       console.log(
         `[ProxyRequest] Retrying with different proxy... (${attempt}/${maxAttempts} attempts)`
@@ -260,6 +265,12 @@ app.post("/api/proxy-request", checkSecret, async (req, res) => {
     // Return original response
     res.status(result.status);
 
+    // Add proxy info to response header for frontend logging
+    // This will be set in makeProxyRequest function
+    if (result.proxyUsed) {
+      res.setHeader("x-proxy-used", result.proxyUsed);
+    }
+
     // Set response headers
     Object.keys(result.headers).forEach((key) => {
       // Skip certain headers that shouldn't be forwarded
@@ -290,16 +301,152 @@ app.post("/api/proxy-request", checkSecret, async (req, res) => {
       res.send(result.body);
     } else if (
       contentType.includes("application/json") ||
-      typeof result.body === "object"
+      (typeof result.body === "object" && result.body !== null && !Buffer.isBuffer(result.body))
     ) {
-      // JSON response
+      // JSON response (but not Buffer)
       res.json(result.body);
-    } else {
-      // Text or other format
+    } else if (result.body !== null && result.body !== undefined) {
+      // Text or other format (but not null/undefined)
       res.send(result.body);
+    } else {
+      // Empty body
+      res.end();
     }
   } catch (error) {
     console.error(`[Server] Error processing request:`, error.message);
+    res.status(500).json({
+      error: "Internal Server Error",
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Parse proxy string from various formats
+ * Supports: ip:port:user:pass or http://user:pass@ip:port
+ */
+function parseProxy(proxyString) {
+  proxyString = proxyString.trim();
+  if (!proxyString) return null;
+
+  let proxy = {
+    host: '',
+    port: '',
+    auth: null
+  };
+
+  // Format: http://user:pass@ip:port
+  if (proxyString.startsWith('http://') || proxyString.startsWith('https://')) {
+    try {
+      const url = new URL(proxyString);
+      proxy.host = url.hostname;
+      proxy.port = url.port || (proxyString.startsWith('https') ? '443' : '80');
+      
+      if (url.username && url.password) {
+        proxy.auth = {
+          username: url.username,
+          password: url.password
+        };
+      }
+    } catch (e) {
+      console.error(`[Server] Invalid URL format: ${proxyString}`, e.message);
+      return null;
+    }
+  } 
+  // Format: ip:port:user:pass
+  else {
+    const parts = proxyString.split(':');
+    if (parts.length >= 2) {
+      proxy.host = parts[0];
+      proxy.port = parts[1];
+      
+      if (parts.length >= 4) {
+        proxy.auth = {
+          username: parts[2],
+          password: parts.slice(3).join(':') // Handle passwords with colons
+        };
+      }
+    } else {
+      console.error(`[Server] Invalid format: ${proxyString}`);
+      return null;
+    }
+  }
+
+  return proxy.host && proxy.port ? proxy : null;
+}
+
+/**
+ * POST /api/proxies - Update proxy list from frontend
+ */
+app.post("/api/proxies", checkSecret, async (req, res) => {
+  try {
+    const { proxies: proxyStrings } = req.body;
+
+    if (!proxyStrings || typeof proxyStrings !== 'string') {
+      return res.status(400).json({
+        error: "Bad Request",
+        message: "Missing or invalid 'proxies' field. Expected string with newline-separated proxies.",
+      });
+    }
+
+    // Parse proxy strings
+    const lines = proxyStrings.split(/\r?\n/);
+    const parsedProxies = [];
+    
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Skip empty lines and comments
+      if (!trimmed || trimmed.startsWith('#')) {
+        continue;
+      }
+      
+      const parsed = parseProxy(trimmed);
+      if (parsed) {
+        parsedProxies.push(parsed);
+      } else {
+        console.warn(`[Server] Skipping invalid proxy: ${trimmed}`);
+      }
+    }
+
+    if (parsedProxies.length === 0) {
+      return res.status(400).json({
+        error: "Bad Request",
+        message: "No valid proxies found in request",
+      });
+    }
+
+    // Update proxy rotator with new proxies
+    proxyRotator.updateProxies(parsedProxies);
+
+    console.log(`[Server] Updated proxy list: ${parsedProxies.length} proxies loaded`);
+
+    res.json({
+      success: true,
+      message: `Successfully updated ${parsedProxies.length} proxies`,
+      count: parsedProxies.length,
+    });
+  } catch (error) {
+    console.error(`[Server] Error updating proxies:`, error.message);
+    res.status(500).json({
+      error: "Internal Server Error",
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/proxies - Get current proxy list (without sensitive info)
+ */
+app.get("/api/proxies", checkSecret, (req, res) => {
+  try {
+    const count = proxyRotator.getProxyCount();
+    res.json({
+      success: true,
+      count: count,
+      message: count > 0 ? `${count} proxies configured` : "No proxies configured",
+    });
+  } catch (error) {
+    console.error(`[Server] Error getting proxies:`, error.message);
     res.status(500).json({
       error: "Internal Server Error",
       message: error.message,

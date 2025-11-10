@@ -21,10 +21,11 @@ export class ProxyRotator {
    * Get number of days since period start
    */
   getDaysSincePeriodStart() {
-    const start = new Date(this.periodStartDate);
-    const today = new Date(this.getCurrentDate());
-    const diffTime = Math.abs(today - start);
-    const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+    const start = new Date(this.periodStartDate + 'T00:00:00');
+    const today = new Date(this.getCurrentDate() + 'T00:00:00');
+    const diffTime = today - start;
+    // Ensure non-negative result (shouldn't happen, but safety check)
+    const diffDays = Math.max(0, Math.floor(diffTime / (1000 * 60 * 60 * 24)));
     return diffDays;
   }
 
@@ -32,6 +33,11 @@ export class ProxyRotator {
    * Check if we need to reset 2-day period usage (after 2 days or all proxies used)
    */
   checkAndResetDailyUsage() {
+    // If no proxies, nothing to reset
+    if (this.proxies.length === 0) {
+      return;
+    }
+
     const today = this.getCurrentDate();
     const daysElapsed = this.getDaysSincePeriodStart();
     
@@ -44,7 +50,7 @@ export class ProxyRotator {
     }
 
     // If all proxies have been used in current period, reset for new cycle
-    if (this.usedProxiesToday.size >= this.proxies.length) {
+    if (this.usedProxiesToday.size >= this.proxies.length && this.proxies.length > 0) {
       console.log(`[ProxyRotator] All ${this.proxies.length} proxies have been used in current 2-day period. Resetting for new cycle.`);
       this.usedProxiesToday.clear();
     }
@@ -112,7 +118,12 @@ export class ProxyRotator {
    */
   markUsedToday(proxyIndex) {
     if (proxyIndex !== null && proxyIndex !== undefined) {
-      this.usedProxiesToday.add(proxyIndex);
+      // Validate index is within bounds
+      if (proxyIndex >= 0 && proxyIndex < this.proxies.length) {
+        this.usedProxiesToday.add(proxyIndex);
+      } else {
+        console.warn(`[ProxyRotator] Invalid proxy index ${proxyIndex} (total proxies: ${this.proxies.length})`);
+      }
     }
   }
 
@@ -121,7 +132,12 @@ export class ProxyRotator {
    */
   markFailed(proxyIndex) {
     if (proxyIndex !== null && proxyIndex !== undefined) {
-      this.failedProxies.add(proxyIndex);
+      // Validate index is within bounds
+      if (proxyIndex >= 0 && proxyIndex < this.proxies.length) {
+        this.failedProxies.add(proxyIndex);
+      } else {
+        console.warn(`[ProxyRotator] Invalid proxy index ${proxyIndex} (total proxies: ${this.proxies.length})`);
+      }
     }
   }
 
@@ -146,6 +162,9 @@ export class ProxyRotator {
   getRemainingProxiesCount() {
     this.checkAndResetDailyUsage();
     const total = this.proxies.length;
+    if (total === 0) {
+      return 0;
+    }
     const used = this.usedProxiesToday.size;
     return Math.max(0, total - used);
   }
@@ -174,6 +193,24 @@ export class ProxyRotator {
       ? `${proxy.auth.username}:${proxy.auth.password}@` 
       : '';
     return `${authStr}${proxy.host}:${proxy.port}`;
+  }
+
+  /**
+   * Update proxy list (resets usage tracking)
+   * Note: This will invalidate any in-flight requests using old proxy indices
+   */
+  updateProxies(newProxies) {
+    const oldCount = this.proxies.length;
+    this.proxies = newProxies || [];
+    
+    // Clear usage tracking since proxy indices may have changed
+    this.usedProxiesToday.clear();
+    this.failedProxies.clear();
+    this.periodStartDate = this.getCurrentDate();
+    
+    if (oldCount !== this.proxies.length) {
+      console.log(`[ProxyRotator] Proxy list updated: ${oldCount} -> ${this.proxies.length} proxies`);
+    }
   }
 }
 
